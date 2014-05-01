@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib
 import wsgiref.simple_server
 
 
@@ -89,7 +90,7 @@ class WMS(object):
       req_body_size = int(environ.get('CONTENT_LENGTH', 0))
       req_body = environ['wsgi.input'].read(req_body_size)
       if req_body.startswith('t='):
-        target = req_body[2:]
+        target = urllib.unquote(req_body[2:])
         mac = self._known_hosts.get(target, target)
         try:
           SendWOLPacket(mac, self._bacast_addr)
