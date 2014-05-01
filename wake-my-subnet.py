@@ -13,7 +13,7 @@ import urllib
 import wsgiref.simple_server
 
 
-BG_RESCAN_INTERVAL_SECS = 60 * 60 * 30  # Rescan network every 30 mins.
+BG_RESCAN_INTERVAL_SECS = 60 * 30  # Rescan network every 30 mins.
 
 CONTENT = """
 <!doctype html>
