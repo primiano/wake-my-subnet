@@ -1,17 +1,20 @@
 #!/usr/bin/env python
 import datetime
-import multiprocessing
 import optparse
+import os
 import re
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import wsgiref.simple_server
 
 
-CONTENT="""
+BG_RESCAN_INTERVAL_SECS = 60 * 60 * 30  # Rescan network every 30 mins.
+
+CONTENT = """
 <!doctype html>
 <html>
 <head>
@@ -35,7 +38,12 @@ CONTENT="""
     <input type="submit" value="WOL">
     </form>
 </body>
-Last network scan: $2
+Network scan status: $2
+<pre>
+How to setup your machine for WOL
+ 1. Enable wake on lan in the BIOS.
+ 2. Add "ethtool -s eth0 wol g" to your rc.local
+</pre>
 </html>
 """
 
@@ -43,7 +51,9 @@ Last network scan: $2
 class WMS(object):
   def __init__(self):
     parser = optparse.OptionParser()
-    parser.add_option('-p', '--port', help='HTTP Port', default=8965, type='int')
+    parser.add_option('-d', '--daemon', help='Daemonize', action='store_true')
+    parser.add_option('-p', '--port', help='HTTP Port', default=8965,
+                      type='int')
     parser.add_option('-i', '--interface', help='Interface IP addr',
                       default=socket.gethostbyname(socket.gethostname()))
     (options, _) = parser.parse_args()
@@ -52,17 +62,25 @@ class WMS(object):
     self._subnet = options.interface.split('.')[0:3]
     self._bacast_addr = '.'.join(self._subnet + ['255'])
     self._known_hosts = {}
-    self._last_scan = ''
+    self._scan_status = 'Not started'
 
-    self._RescanNetwork()
+    print 'Serving on http://localhost:%d/' % options.port
 
-    print 'Starting HTTP server at port %d' % options.port
+    if options.daemon:
+      print 'Forking into daemon land.'
+      Daemonize()
+
+    self._rescan_thread = threading.Thread(target=self._RescanThread)
+    self._rescan_thread.daemon = True
+    self._rescan_thread.start()
+
     httpd = wsgiref.simple_server.make_server(
         '', options.port, self._HttpHandler)
     httpd.serve_forever()
 
+
   def _HttpHandler(self, environ, start_response):
-    path = environ['PATH_INFO']
+    # path = environ['PATH_INFO']
     method = environ['REQUEST_METHOD']
     start_response('200 OK', [('Content-Type', 'text/html'),
                               ('Cache-Control', 'no-cache'),
@@ -73,38 +91,59 @@ class WMS(object):
       if req_body.startswith('t='):
         target = req_body[2:]
         mac = self._known_hosts.get(target, target)
-        SendWOLPacket(mac, self._bacast_addr)
-        return ['Sending WOL packet to %s' % mac]
+        try:
+          SendWOLPacket(mac, self._bacast_addr)
+          return ['Sending WOL packet to %s' % mac]
+        except:
+          return ['Error while waking "%s": %s' % (mac, sys.exc_info())]
+          raise
+
     else:
       hosts_datalist = ''
       for host, mac in self._known_hosts.iteritems():
         hosts_datalist += '<option value="%s">%s</option>' % (host, mac)
       html = str(CONTENT.replace('$1', hosts_datalist))
-      html = str(html.replace('$2', str(self._last_scan)))
+      html = str(html.replace('$2', str(self._scan_status)))
       return [html]
+
 
   def _RescanNetwork(self):
     print 'Scanning subnet'
     subnet_addrs = ['.'.join(self._subnet + [str(i)]) for i in xrange(1, 255)]
-    pool = multiprocessing.Pool(processes=20)
     pinged_addrs_count = 0
-    for (host_or_ip, mac_addr) in pool.imap_unordered(LookupHost, subnet_addrs):
+    for target_ip in subnet_addrs:
+      host_or_ip, mac_addr = Lookup(target_ip)
       pinged_addrs_count += 1
-      print '  Ping: %d/%d   \r' % (pinged_addrs_count, len(subnet_addrs)),
+      ping_stat = 'Ping: %d/%d' % (pinged_addrs_count, len(subnet_addrs))
+      self._scan_status = ping_stat
+      print ping_stat, '  \r',
       if mac_addr:
         self._known_hosts[host_or_ip] = mac_addr
     print '\rDiscovered %d hosts' % len(self._known_hosts)
-    self._last_scan = datetime.datetime.now()
+    self._scan_status = datetime.datetime.now()
 
-def LookupHost(target_ip):
+
+  def _RescanThread(self):
+    while(True):
+      self._RescanNetwork()
+      time.sleep(BG_RESCAN_INTERVAL_SECS)
+
+
+def Lookup(target_ip):
   p = subprocess.Popen(['arping', '-f', '-w1', target_ip],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  time.sleep(1)
+  if p.poll() is None:
+    p.kill()
+    os.wait()
+    return (target_ip, None)
   output, _ = p.communicate()
   match = re.search('reply.*\[([\w:]+)\]', output)
   if not match:
     return (target_ip, None)
   mac = match.group(1)
   try:
+    socket.setdefaulttimeout(1)
     host_info = socket.gethostbyaddr(target_ip)
   except socket.herror:
     host_info = None
@@ -118,11 +157,31 @@ def SendWOLPacket(mac, bcast_addr='<broadcast>'):
   magic = 'FFFFFFFFFFFF' + (mac * 20)
   payload = ''
   for i in range(0, len(magic), 2):
-      payload = ''.join([payload,
-                         struct.pack('B', int(magic[i: i + 2], 16))])
+    payload = ''.join(
+        [payload, struct.pack('B', int(magic[i: i + 2], 16))])
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
   sock.sendto(payload, (bcast_addr, 7))
+
+def Daemonize():
+  pid = os.fork()
+  if pid > 0:
+    sys.exit(0)  # exit first parent
+
+  os.setsid()
+  os.umask(0)
+
+  pid = os.fork()
+  if pid > 0:
+    sys.exit(0)  # exit second parent
+
+  sys.stdout.flush()
+  sys.stderr.flush()
+  null_in = file('/dev/null', 'r')
+  null_out = file('/dev/null', 'a+')
+  os.dup2(null_in.fileno(), sys.stdin.fileno())
+  os.dup2(null_out.fileno(), sys.stdout.fileno())
+  os.dup2(null_out.fileno(), sys.stderr.fileno())
 
 
 if __name__ == '__main__':

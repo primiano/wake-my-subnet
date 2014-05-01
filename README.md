@@ -9,6 +9,7 @@ to send a WOL magic packet (UDP port 7) to either:
  - An arbitrary MAC address entered by the user.
 
 **Usage**
- * `./wake-my-subnet -p 8080`
+ * `./wake-my-subnet -p 8080 --daemon`
+   (or if you are a bit more paranoid: `sudo -u nobody ./wake-my-subnet -p 8080`)
  * Open the browser at http://localhost:8080
  * Enjoy :-)
